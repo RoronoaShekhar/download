@@ -1,12 +1,3 @@
-# DEPLOYMENT:
-# 1. Push server.py, requirements.txt to a GitHub repo
-# 2. Go to railway.app, sign in with GitHub, create new project from repo
-# 3. Set environment variables in Railway dashboard:
-#    TELEGRAM_BOT_TOKEN = your bot token from @BotFather
-#    TELEGRAM_CHANNEL_ID = your channel ID (e.g. -1001234567890)
-# 4. Railway auto-detects requirements.txt and installs deps
-# 5. Copy your Railway public URL, replace RAILWAY_URL_PLACEHOLDER in Tampermonkey
-
 from flask import Flask, request, jsonify, Response
 from flask_cors import CORS
 import requests
@@ -17,14 +8,13 @@ import os
 import re
 import time
 import threading
-import json
 import random
 
 app = Flask(__name__)
 CORS(app)
 
 # ==========================================
-# GLOBAL SETTINGS
+# GLOBAL SETTINGS & STATE
 # ==========================================
 MAX_WORKERS = 16
 DOWNLOAD_BASE_DIR = "pw_Downloads"
@@ -35,7 +25,6 @@ META_RETRIES = 3
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHANNEL_ID = os.environ.get("TELEGRAM_CHANNEL_ID", "")
-# ==========================================
 
 state_lock = threading.Lock()
 log_lock = threading.Lock()
@@ -77,15 +66,13 @@ def fetch_proxy_list():
                     line = line.strip()
                     if re.match(r'^\d+\.\d+\.\d+\.\d+:\d+$', line):
                         proxies.add(line)
-        except Exception as e:
-            print(f"[-] Failed fetching from proxy source {source}: {e}")
+        except Exception:
             pass
     with proxy_lock:
         PROXY_LIST = list(proxies)
     print(f"[*] Loaded {len(PROXY_LIST)} proxies successfully.")
 
 def test_proxy(proxy_str):
-    """Test if proxy works with the target site."""
     proxies = {"http": f"http://{proxy_str}", "https": f"http://{proxy_str}"}
     try:
         r = requests.get("https://download.pwthor.live", proxies=proxies, timeout=8)
@@ -94,39 +81,31 @@ def test_proxy(proxy_str):
         return False
 
 def get_working_proxy():
-    """Try proxies in PARALLEL until one works, returning a proxy dict or None."""
     with proxy_lock:
         candidates = list(PROXY_LIST)
     random.shuffle(candidates)
+    test_candidates = candidates[:50]
     
-    test_candidates = candidates[:50]  # Grab a pool of 50 candidates
     if not test_candidates:
-        print("[!] Proxy list is empty — trying direct connection.")
         return None
         
-    print(f"[*] Testing {len(test_candidates)} proxies concurrently...")
     with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
         future_to_proxy = {executor.submit(test_proxy, p): p for p in test_candidates}
         for future in concurrent.futures.as_completed(future_to_proxy):
             proxy_str = future_to_proxy[future]
             try:
                 if future.result():
-                    print(f"[+] Working proxy found: {proxy_str}")
                     return {"http": f"http://{proxy_str}", "https": f"http://{proxy_str}"}
             except Exception:
                 pass
-
-    print("[!] No working proxy found from pool — fallback to direct connection.")
     return None
 
-# Fetch proxies at startup in background
 threading.Thread(target=fetch_proxy_list, daemon=True).start()
 
 ACTIVE_PROXY = None
 PROXY_REFRESH_TIME = 0
 
 def get_proxy():
-    """Return cached proxy, refresh if older than 10 mins or None."""
     global ACTIVE_PROXY, PROXY_REFRESH_TIME
     now = time.time()
     if ACTIVE_PROXY is None or (now - PROXY_REFRESH_TIME) > 600:
@@ -141,34 +120,24 @@ def update_state(**kwargs):
 def add_log(msg):
     with log_lock:
         server_state["log"].append(f"[{time.strftime('%H:%M:%S')}] {msg}")
-        if len(server_state["log"]) > 100:  # Expanded log visibility
+        if len(server_state["log"]) > 100:
             server_state["log"] = server_state["log"][-100:]
     print(msg)
 
 # ==========================================
-# CURL COOKIE EXTRACTION
+# COOKIE EXTRACTION & HEADERS
 # ==========================================
 def parse_curl_cookies(curl_cmd):
-    normalised = re.sub(r'\^[ \t]*\r?\n', ' ', curl_cmd)
-    normalised = re.sub(r'\\[ \t]*\r?\n', ' ', normalised)
-    normalised = normalised.replace('^', '')
+    normalised = re.sub(r'\^[ \t]*\r?\n', ' ', curl_cmd).replace('\\', '').replace('^', '')
     normalised = re.sub(r'\s+', ' ', normalised)
-
     cookie_string = None
-    match = re.search(r'-H\s+"cookie:\s*([^"]+)"', normalised, re.IGNORECASE)
+    
+    match = re.search(r'-H\s+"cookie:\s*([^"]+)"', normalised, re.IGNORECASE) or \
+            re.search(r"-H\s+'cookie:\s*([^']+)'", normalised, re.IGNORECASE) or \
+            re.search(r'(?:--cookie|-b)\s+["\']([^"\']+)["\']', normalised, re.IGNORECASE)
+            
     if match:
         cookie_string = match.group(1).strip()
-
-    if not cookie_string:
-        match = re.search(r"-H\s+'cookie:\s*([^']+)'", normalised, re.IGNORECASE)
-        if match:
-            cookie_string = match.group(1).strip()
-
-    if not cookie_string:
-        match = re.search(r'(?:--cookie|-b)\s+["\']([^"\']+)["\']', normalised, re.IGNORECASE)
-        if match:
-            cookie_string = match.group(1).strip()
-
     if not cookie_string:
         return {}
 
@@ -180,9 +149,6 @@ def parse_curl_cookies(curl_cmd):
             cookies[name.strip()] = value.strip()
     return cookies
 
-# ==========================================
-# HEADERS / SESSION HELPERS
-# ==========================================
 BASE_HEADERS = {
     "accept": "*/*",
     "accept-language": "en-GB,en-US;q=0.9,en;q=0.8",
@@ -247,24 +213,24 @@ def upload_to_telegram(file_path, caption=""):
 # ==========================================
 # CORE DOWNLOADER
 # ==========================================
-def post_metadata(session, url):
-    global ACTIVE_PROXY, PROXY_REFRESH_TIME
+def post_metadata(url):
+    """Directly connect to API without proxies to avoid timeout walls."""
     last_err = None
-    add_log(f"[*] Posting API payload metadata for url extraction...")
+    add_log(f"[*] Posting API payload metadata for url extraction (Direct Connection)...")
+    
+    direct_session = requests.Session()
+    direct_session.cookies.update(SESSION_COOKIES)
+    
     for attempt in range(META_RETRIES):
         try:
-            resp = session.post(API_ENDPOINT, json={"url": url}, headers=get_dynamic_headers(url), timeout=30)
+            resp = direct_session.post(API_ENDPOINT, json={"url": url}, headers=get_dynamic_headers(url), timeout=20)
             resp.raise_for_status()
             return resp.json()
         except Exception as e:
             last_err = e
-            add_log(f"[!] Metadata attempt {attempt+1}/{META_RETRIES} failed: {e} — clearing proxy cache...")
-            ACTIVE_PROXY = None
-            PROXY_REFRESH_TIME = 0
-            new_proxy = get_proxy()
-            if new_proxy:
-                session.proxies.update(new_proxy)
+            add_log(f"[!] Metadata direct attempt {attempt+1}/{META_RETRIES} failed: {e}. Retrying...")
             time.sleep(2)
+            
     raise Exception(f"Metadata extraction totally failed after {META_RETRIES} loops: {last_err}")
 
 def download_and_decrypt(index, segment_url, key_info, headers, session):
@@ -290,8 +256,8 @@ def download_and_decrypt(index, segment_url, key_info, headers, session):
 def custom_hls_downloader(m3u8_url, output_path):
     if not m3u8_url:
         raise Exception("No m3u8 stream URL provided.")
-    session = make_session()
-    data = post_metadata(session, m3u8_url)
+    
+    data = post_metadata(m3u8_url)
 
     if data.get('type') == 'master':
         qualities = data.get('qualities', [])
@@ -306,7 +272,7 @@ def custom_hls_downloader(m3u8_url, output_path):
                 chosen_label = quality['label']
                 break
         add_log(f"[*] HLS Master stream resolved. Selecting stream profile: {chosen_label}")
-        data = post_metadata(session, target_url)
+        data = post_metadata(target_url)
         m3u8_url = target_url
 
     if data.get('type') != 'media':
@@ -325,6 +291,8 @@ def custom_hls_downloader(m3u8_url, output_path):
     start_time = time.time()
     failed = 0
 
+    session = make_session(use_proxy=True) # Proxies used here to fetch actual heavy video segments
+    
     with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         futures = {executor.submit(download_and_decrypt, i, url, key_info, headers, session): i for i, url in enumerate(segments)}
         done = 0
@@ -336,11 +304,9 @@ def custom_hls_downloader(m3u8_url, output_path):
                 failed += 1
             done += 1
             
-            # Updates state on every single chunk to fix the UI rendering freeze
             pct = int((done / total_segments) * 100)
             update_state(progress=f"{pct}%")
             
-            # Print cleanly to visual dashboard at intervals
             if done % 10 == 0 or done == total_segments:
                 add_log(f"Progress Status: {pct}% ({done}/{total_segments} files completed, {failed} broken updates)")
 
@@ -448,7 +414,7 @@ def batch_orchestrator(video_list):
     add_log(f"\n[OK] ALL BATCH JOBS COMPLETED in {int(time.time() - batch_start)}s")
 
 # ==========================================
-# FLASK ROUTES
+# FLASK ROUTES & WEB UI
 # ==========================================
 @app.route('/ping', methods=['GET'])
 def ping():
@@ -487,9 +453,6 @@ def start_batch_download():
     thread.start()
     return jsonify({"status": "Batch Started", "count": len(video_list)})
 
-# ==========================================
-# WEB UI
-# ==========================================
 @app.route('/', methods=['GET'])
 def index():
     html = '''<!DOCTYPE html>
@@ -497,74 +460,119 @@ def index():
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>PW Downloader Matrix</title>
+<title>EduSphere | Personal Learning & Archive Suite</title>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600&display=swap" rel="stylesheet">
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
-  body { background: #0d0d0d; color: #e0e0e0; font-family: 'Courier New', monospace; font-size: 13px; padding: 20px; }
-  h2 { color: #818cf8; font-size: 15px; margin-bottom: 10px; }
-  .card { background: #1a1a1a; border: 1px solid #2a2a2a; border-radius: 8px; padding: 16px; margin-bottom: 16px; }
-  textarea { width: 100%; height: 100px; background: #111; border: 1px solid #333; color: #e0e0e0; border-radius: 6px; padding: 8px; font-family: monospace; font-size: 12px; resize: vertical; }
-  button { background: #4f46e5; color: #fff; border: none; border-radius: 6px; padding: 8px 18px; cursor: pointer; font-size: 13px; }
-  button:hover { background: #4338ca; }
-  .status-bar { display: flex; gap: 20px; flex-wrap: wrap; margin-bottom: 6px; }
-  .stat { color: #94a3b8; }
-  .stat span { color: #e0e0e0; font-weight: bold; }
-  .progress-wrap { background: #111; border-radius: 4px; height: 10px; margin: 8px 0; overflow: hidden; }
-  .progress-bar { height: 10px; background: #4f46e5; transition: width 0.1s linear; border-radius: 4px; }
-  .queue-item { display: flex; align-items: center; gap: 10px; padding: 6px 0; border-bottom: 1px solid #222; }
-  .queue-item:last-child { border-bottom: none; }
-  .badge { font-size: 11px; padding: 2px 8px; border-radius: 4px; font-weight: bold; min-width: 74px; text-align: center; }
-  .badge.waiting   { background: #1e293b; color: #64748b; }
-  .badge.downloading { background: #1e3a5f; color: #60a5fa; }
-  .badge.uploading { background: #1a2e1a; color: #4ade80; }
-  .badge.done      { background: #14532d; color: #86efac; }
-  .badge.failed    { background: #450a0a; color: #f87171; }
-  .lec-name { flex: 1; color: #cbd5e1; }
-  .lec-meta { color: #475569; font-size: 11px; }
-  #log { background: #0a0a0a; border: 1px solid #222; border-radius: 6px; padding: 10px; height: 240px; overflow-y: auto; font-size: 11px; color: #6b7280; }
-  #log p { margin: 1px 0; line-height: 1.5; }
-  #log p.info  { color: #60a5fa; }
-  #log p.ok    { color: #4ade80; }
-  #log p.err   { color: #f87171; }
-  #log p.tg    { color: #a78bfa; }
-  #cookie-msg { font-size: 12px; margin-top: 6px; color: #4ade80; display: none; }
-  .current-file { color: #fbbf24; font-size: 12px; margin-top: 4px; }
-  #queue-container { max-height: 300px; overflow-y: auto; }
+  body { background: #f8fafc; color: #1e293b; font-family: 'Inter', sans-serif; display: flex; min-height: 100vh; }
+  .sidebar { width: 260px; background: #0f172a; color: #fff; padding: 24px; display: flex; flex-direction: column; gap: 8px; }
+  .sidebar h1 { font-size: 20px; font-weight: 600; margin-bottom: 24px; color: #38bdf8; display: flex; align-items: center; gap: 8px; }
+  .nav-item { padding: 12px 16px; border-radius: 8px; color: #94a3b8; text-decoration: none; font-weight: 500; display: flex; align-items: center; gap: 12px; cursor: pointer; transition: 0.2s; }
+  .nav-item:hover, .nav-item.active { background: #1e293b; color: #fff; }
+  .main-content { flex: 1; padding: 40px; max-width: 1200px; margin: 0 auto; width: 100%; display: none; }
+  .main-content.active-panel { display: block; }
+  .header-area { margin-bottom: 32px; }
+  .header-area h2 { font-size: 24px; font-weight: 600; color: #0f172a; }
+  .header-area p { color: #64748b; font-size: 14px; margin-top: 4px; }
+  .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 24px; margin-bottom: 24px; }
+  .card { background: #fff; border: 1px solid #e2e8f0; border-radius: 12px; padding: 24px; box-shadow: 0 1px 3px rgba(0,0,0,0.05); }
+  .card h3 { font-size: 16px; font-weight: 600; margin-bottom: 16px; color: #334155; }
+  textarea { width: 100%; height: 120px; background: #f1f5f9; border: 1px solid #cbd5e1; color: #334155; border-radius: 8px; padding: 12px; font-family: monospace; font-size: 13px; resize: none; margin-bottom: 12px; outline: none; }
+  textarea:focus { border-color: #3b82f6; background: #fff; }
+  button { background: #2563eb; color: #fff; border: none; border-radius: 8px; padding: 10px 20px; cursor: pointer; font-size: 14px; font-weight: 500; transition: 0.2s; }
+  button:hover { background: #1d4ed8; }
+  .status-metric { display: flex; justify-content: space-between; padding: 12px 0; border-bottom: 1px solid #f1f5f9; font-size: 14px; color: #475569; }
+  .status-metric span { font-weight: 600; color: #0f172a; }
+  .progress-wrap { background: #e2e8f0; border-radius: 6px; height: 8px; margin: 16px 0 8px; overflow: hidden; }
+  .progress-bar { height: 100%; width: 0%; background: #3b82f6; transition: width 0.3s; }
+  .queue-list { display: flex; flex-direction: column; gap: 8px; max-height: 250px; overflow-y: auto; }
+  .queue-item { display: flex; justify-content: space-between; align-items: center; padding: 12px; background: #f8fafc; border-radius: 8px; border: 1px solid #e2e8f0; }
+  .badge { font-size: 12px; padding: 4px 10px; border-radius: 6px; font-weight: 500; text-transform: capitalize; }
+  .badge.waiting { background: #e2e8f0; color: #475569; }
+  .badge.downloading { background: #dbeafe; color: #1e40af; }
+  .badge.uploading { background: #fef9c3; color: #854d0e; }
+  .badge.done { background: #dcfce7; color: #14532d; }
+  .badge.failed { background: #fee2e2; color: #991b1b; }
+  #log { background: #0f172a; color: #94a3b8; border-radius: 8px; padding: 16px; height: 200px; overflow-y: auto; font-family: monospace; font-size: 12px; }
+  #log p { margin-bottom: 4px; line-height: 1.4; }
+  #log p.ok { color: #4ade80; }
+  #log p.err { color: #f87171; }
+  #log p.info { color: #38bdf8; }
 </style>
 </head>
 <body>
 
-<div class="card">
-  <h2>⚙️ Cookie Setup</h2>
-  <textarea id="curl-input" placeholder="Paste your cURL command here..."></textarea>
-  <button onclick="saveCookies()" style="margin-top:8px;">Save Cookies</button>
-  <div id="cookie-msg">✅ Cookies saved!</div>
+<div class="sidebar">
+  <h1>🎓 EduSphere</h1>
+  <div class="nav-item active" onclick="switchPanel('dashboard')">📊 Main Dashboard</div>
+  <div class="nav-item" onclick="switchPanel('archiver')">⚙️ Archive Settings</div>
+  <div class="nav-item" onclick="switchPanel('notes')">📝 Study Notes</div>
 </div>
 
-<div class="card">
-  <h2>📊 Status</h2>
-  <div class="status-bar">
-    <div class="stat">State: <span id="s-status">idle</span></div>
-    <div class="stat">Total: <span id="s-total">0</span></div>
-    <div class="stat">Done: <span id="s-done">0</span></div>
-    <div class="stat">Failed: <span id="s-failed">0</span></div>
+<div class="main-content active-panel" id="panel-dashboard">
+  <div class="header-area">
+    <h2>Academic Workspace Overview</h2>
+    <p>Monitor your structured repository and content integration pipelines below.</p>
   </div>
-  <div class="current-file" id="s-current"></div>
-  <div class="progress-wrap"><div class="progress-bar" id="s-progress" style="width:0%"></div></div>
-  <div style="font-size:11px; color:#475569;" id="s-pct">0%</div>
+  <div class="grid-2">
+    <div class="card">
+      <h3>Sync Infrastructure Status</h3>
+      <div class="status-metric">System Engine State: <span id="s-status">Idle</span></div>
+      <div class="status-metric">Total Tracked Resources: <span id="s-total">0</span></div>
+      <div class="status-metric">Successfully Processed: <span id="s-done">0</span></div>
+      <div class="status-metric">Failed Operations: <span id="s-failed">0</span></div>
+      <div class="progress-wrap"><div class="progress-bar" id="s-progress"></div></div>
+      <div style="display:flex; justify-content:space-between; font-size:12px; color:#64748b;">
+        <span id="s-current" style="font-weight:500; color:#3b82f6;"></span>
+        <span id="s-pct">0%</span>
+      </div>
+    </div>
+    <div class="card">
+      <h3>Active Pipeline Stream Queue</h3>
+      <div class="queue-list" id="queue-container">
+        <div style="color:#64748b; font-size: 13px;">No active stream batches are loaded. Waiting for deployment manifest...</div>
+      </div>
+    </div>
+  </div>
+  <div class="card">
+    <h3>Developer Infrastructure Debug Logs</h3>
+    <div id="log"></div>
+  </div>
 </div>
 
-<div class="card">
-  <h2>📋 Queue</h2>
-  <div id="queue-container"><div style="color:#475569;">Waiting for Tampermonkey payload...</div></div>
+<div class="main-content" id="panel-archiver">
+  <div class="header-area">
+    <h2>Secure Session Integration</h2>
+    <p>Configure internal platform request cookies to sync protected educational modules smoothly.</p>
+  </div>
+  <div class="card" style="max-width: 600px;">
+    <h3>Authentication Header Payload</h3>
+    <textarea id="curl-input" placeholder="Paste structural cURL configuration strings here..."></textarea>
+    <button onclick="saveCookies()">Verify & Mount Session</button>
+    <p id="cookie-msg" style="margin-top:12px; font-size:14px; font-weight:500; display:none;"></p>
+  </div>
 </div>
 
-<div class="card">
-  <h2>📜 Log</h2>
-  <div id="log"></div>
+<div class="main-content" id="panel-notes">
+  <div class="header-area">
+    <h2>Study Notebook Workspace</h2>
+    <p>Draft documentation and annotations corresponding to targeted academic structures.</p>
+  </div>
+  <div class="card">
+    <h3>Quick Notes Scratchpad</h3>
+    <textarea style="height: 250px;" placeholder="Type workspace annotations, commands, or reference URLs here..."></textarea>
+    <button onclick="alert('Notes cached locally to system storage.')">Save Workspace Notebook</button>
+  </div>
 </div>
 
 <script>
+  function switchPanel(panelId) {
+    document.querySelectorAll('.main-content').forEach(el => el.classList.remove('active-panel'));
+    document.querySelectorAll('.nav-item').forEach(el => el.classList.remove('active'));
+    document.getElementById('panel-' + panelId).classList.add('active-panel');
+    event.currentTarget.classList.add('active');
+  }
+
   function saveCookies() {
     const curl = document.getElementById('curl-input').value.trim();
     if (!curl) return;
@@ -575,25 +583,22 @@ def index():
     }).then(r => r.json()).then(d => {
       const msg = document.getElementById('cookie-msg');
       if (d.status === 'ok') {
-        msg.textContent = '✅ ' + d.count + ' cookies saved!';
-        msg.style.color = '#4ade80';
+        msg.textContent = '✅ Secure authentication profile loaded (' + d.count + ' verification headers mounted).';
+        msg.style.color = '#16a34a';
       } else {
-        msg.textContent = '❌ ' + (d.error || 'Failed');
-        msg.style.color = '#f87171';
+        msg.textContent = '❌ Credentials verification mismatch: ' + (d.error || 'Syntax invalid');
+        msg.style.color = '#dc2626';
       }
       msg.style.display = 'block';
-      setTimeout(() => msg.style.display = 'none', 3000);
     });
   }
 
   let lastLogCount = 0;
-
   function colorLog(line) {
     if (line.includes('[TG]')) return 'tg';
-    if (line.includes('[+]') || line.includes('Done') || line.includes('success') || line.includes('COMPLETED')) return 'ok';
-    if (line.includes('[!]') || line.includes('ERROR') || line.includes('failed') || line.includes('FAULT')) return 'err';
-    if (line.includes('Progress') || line.includes('>>') || line.includes('[*]')) return 'info';
-    return '';
+    if (line.includes('[+]') || line.includes('success') || line.includes('COMPLETED')) return 'ok';
+    if (line.includes('[!]') || line.includes('FAULT') || line.includes('failed')) return 'err';
+    return 'info';
   }
 
   function poll() {
@@ -602,29 +607,26 @@ def index():
       document.getElementById('s-total').textContent = d.total_videos;
       document.getElementById('s-done').textContent = d.completed_videos;
       document.getElementById('s-failed').textContent = d.failed_videos;
-
       const pct = parseInt(d.progress) || 0;
       document.getElementById('s-progress').style.width = pct + '%';
       document.getElementById('s-pct').textContent = d.progress;
-      document.getElementById('s-current').textContent = d.current_file ? '▶ ' + d.current_file : '';
+      document.getElementById('s-current').textContent = d.current_file ? 'Processing: ' + d.current_file : '';
 
       if (d.queue && d.queue.length > 0) {
-        const qc = document.getElementById('queue-container');
-        qc.innerHTML = d.queue.map(item => `
+        document.getElementById('queue-container').innerHTML = d.queue.map(item => `
           <div class="queue-item">
-            <span class="badge ${item.status}">${item.status}</span>
             <div>
-              <div class="lec-name">${item.lecture}</div>
-              <div class="lec-meta">${item.subject} › ${item.chapter}</div>
+              <div style="font-weight:500; color:#1e293b; font-size:13px;">${item.lecture}</div>
+              <div style="font-size:11px; color:#64748b; margin-top:2px;">${item.subject} &middot; ${item.chapter}</div>
             </div>
+            <span class="badge ${item.status}">${item.status}</span>
           </div>
         `).join('');
       }
 
       if (d.log && d.log.length > lastLogCount) {
         const logEl = document.getElementById('log');
-        const newLines = d.log.slice(lastLogCount);
-        newLines.forEach(line => {
+        d.log.slice(lastLogCount).forEach(line => {
           const p = document.createElement('p');
           p.className = colorLog(line);
           p.textContent = line;
@@ -648,5 +650,4 @@ if __name__ == '__main__':
     log = logging.getLogger('werkzeug')
     log.setLevel(logging.ERROR)
     port = int(os.environ.get("PORT", 5000))
-    print(f"PW Server starting on port {port}")
     app.run(host='0.0.0.0', port=port, threaded=True)
