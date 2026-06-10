@@ -201,7 +201,7 @@ def sanitize_filename(name):
     if not name:
         name = "Unknown"
     cleaned = "".join(c for c in str(name) if c.isalnum() or c in " ._-()[]").strip()
-    return cleaned[:120] if cleaned else "Unknown" fuse
+    return cleaned[:120] if cleaned else "Unknown"
 
 def get_dynamic_headers(m3u8_url):
     headers = dict(BASE_HEADERS)
@@ -336,11 +336,11 @@ def custom_hls_downloader(m3u8_url, output_path):
                 failed += 1
             done += 1
             
-            # FIXED: UI updates on every individual chunk for smooth rendering
+            # Updates state on every single chunk to fix the UI rendering freeze
             pct = int((done / total_segments) * 100)
             update_state(progress=f"{pct}%")
             
-            # Text logs remain readable without flooding
+            # Print cleanly to visual dashboard at intervals
             if done % 10 == 0 or done == total_segments:
                 add_log(f"Progress Status: {pct}% ({done}/{total_segments} files completed, {failed} broken updates)")
 
