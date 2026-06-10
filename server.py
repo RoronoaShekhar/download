@@ -77,11 +77,12 @@ def fetch_proxy_list():
                     line = line.strip()
                     if re.match(r'^\d+\.\d+\.\d+\.\d+:\d+$', line):
                         proxies.add(line)
-        except Exception:
+        except Exception as e:
+            print(f"[-] Failed fetching from proxy source {source}: {e}")
             pass
     with proxy_lock:
         PROXY_LIST = list(proxies)
-    print(f"[*] Loaded {len(PROXY_LIST)} proxies.")
+    print(f"[*] Loaded {len(PROXY_LIST)} proxies successfully.")
 
 def test_proxy(proxy_str):
     """Test if proxy works with the target site."""
@@ -93,15 +94,29 @@ def test_proxy(proxy_str):
         return False
 
 def get_working_proxy():
-    """Try proxies until one works, return proxy dict or None."""
+    """Try proxies in PARALLEL until one works, returning a proxy dict or None."""
     with proxy_lock:
         candidates = list(PROXY_LIST)
     random.shuffle(candidates)
-    for proxy_str in candidates[:30]:  # Test up to 30
-        if test_proxy(proxy_str):
-            print(f"[+] Working proxy found: {proxy_str}")
-            return {"http": f"http://{proxy_str}", "https": f"http://{proxy_str}"}
-    print("[!] No working proxy found — trying direct connection.")
+    
+    test_candidates = candidates[:50]  # Grab a pool of 50 candidates
+    if not test_candidates:
+        print("[!] Proxy list is empty — trying direct connection.")
+        return None
+        
+    print(f"[*] Testing {len(test_candidates)} proxies concurrently...")
+    with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
+        future_to_proxy = {executor.submit(test_proxy, p): p for p in test_candidates}
+        for future in concurrent.futures.as_completed(future_to_proxy):
+            proxy_str = future_to_proxy[future]
+            try:
+                if future.result():
+                    print(f"[+] Working proxy found: {proxy_str}")
+                    return {"http": f"http://{proxy_str}", "https": f"http://{proxy_str}"}
+            except Exception:
+                pass
+
+    print("[!] No working proxy found from pool — fallback to direct connection.")
     return None
 
 # Fetch proxies at startup in background
@@ -126,8 +141,8 @@ def update_state(**kwargs):
 def add_log(msg):
     with log_lock:
         server_state["log"].append(f"[{time.strftime('%H:%M:%S')}] {msg}")
-        if len(server_state["log"]) > 50:
-            server_state["log"] = server_state["log"][-50:]
+        if len(server_state["log"]) > 100:  # Expanded log visibility
+            server_state["log"] = server_state["log"][-100:]
     print(msg)
 
 # ==========================================
@@ -186,7 +201,7 @@ def sanitize_filename(name):
     if not name:
         name = "Unknown"
     cleaned = "".join(c for c in str(name) if c.isalnum() or c in " ._-()[]").strip()
-    return cleaned[:120] if cleaned else "Unknown"
+    return cleaned[:120] if cleaned else "Unknown" fuse
 
 def get_dynamic_headers(m3u8_url):
     headers = dict(BASE_HEADERS)
@@ -211,22 +226,22 @@ def upload_to_telegram(file_path, caption=""):
         add_log("[!] Telegram not configured — skipping upload.")
         return False
     try:
-        add_log(f"[TG] Uploading to Telegram: {os.path.basename(file_path)}")
+        add_log(f"[TG] Launching file upload to Telegram: {os.path.basename(file_path)}")
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendVideo"
         with open(file_path, 'rb') as f:
             resp = requests.post(url, data={
                 "chat_id": TELEGRAM_CHANNEL_ID,
                 "caption": caption,
                 "supports_streaming": True
-            }, files={"video": f}, timeout=300)
+            }, files={"video": f}, timeout=450)
         if resp.status_code == 200:
             add_log(f"[TG] Upload success: {os.path.basename(file_path)}")
             return True
         else:
-            add_log(f"[TG] Upload failed ({resp.status_code}): {resp.text[:200]}")
+            add_log(f"[TG] Upload failed Status ({resp.status_code}): {resp.text[:300]}")
             return False
     except Exception as e:
-        add_log(f"[TG] Upload error: {e}")
+        add_log(f"[TG] Critical uploading exception occurred: {e}")
         return False
 
 # ==========================================
@@ -235,6 +250,7 @@ def upload_to_telegram(file_path, caption=""):
 def post_metadata(session, url):
     global ACTIVE_PROXY, PROXY_REFRESH_TIME
     last_err = None
+    add_log(f"[*] Posting API payload metadata for url extraction...")
     for attempt in range(META_RETRIES):
         try:
             resp = session.post(API_ENDPOINT, json={"url": url}, headers=get_dynamic_headers(url), timeout=30)
@@ -242,15 +258,14 @@ def post_metadata(session, url):
             return resp.json()
         except Exception as e:
             last_err = e
-            add_log(f"[!] Metadata attempt {attempt+1} failed: {e} — rotating proxy...")
-            # Force proxy refresh on next attempt
+            add_log(f"[!] Metadata attempt {attempt+1}/{META_RETRIES} failed: {e} — clearing proxy cache...")
             ACTIVE_PROXY = None
             PROXY_REFRESH_TIME = 0
             new_proxy = get_proxy()
             if new_proxy:
                 session.proxies.update(new_proxy)
             time.sleep(2)
-    raise Exception(f"Metadata fetch failed after {META_RETRIES} attempts: {last_err}")
+    raise Exception(f"Metadata extraction totally failed after {META_RETRIES} loops: {last_err}")
 
 def download_and_decrypt(index, segment_url, key_info, headers, session):
     for attempt in range(SEGMENT_RETRIES):
@@ -264,33 +279,38 @@ def download_and_decrypt(index, segment_url, key_info, headers, session):
             iv = bytes.fromhex(key_info['ivHex']) if key_info.get('ivHex') else (index + 1).to_bytes(16, byteorder='big')
             cipher = AES.new(key, AES.MODE_CBC, iv)
             return index, cipher.decrypt(encrypted_data)
-        except Exception:
+        except Exception as e:
             if attempt < SEGMENT_RETRIES - 1:
-                time.sleep(2)
+                time.sleep(1.5)
             else:
+                add_log(f"[!] Chunk #{index} failed completely after max retries. Error: {e}")
                 return index, None
     return index, None
 
 def custom_hls_downloader(m3u8_url, output_path):
     if not m3u8_url:
-        raise Exception("No mpd_url provided.")
+        raise Exception("No m3u8 stream URL provided.")
     session = make_session()
     data = post_metadata(session, m3u8_url)
 
     if data.get('type') == 'master':
         qualities = data.get('qualities', [])
         if not qualities:
-            raise Exception("Master playlist has no qualities.")
+            raise Exception("Master playlist detected but contains no available video streams.")
+        
         target_url = qualities[0]['url']
+        chosen_label = qualities[0].get('label', 'Default')
         for quality in qualities:
             if '480' in str(quality.get('label', '')):
                 target_url = quality['url']
+                chosen_label = quality['label']
                 break
+        add_log(f"[*] HLS Master stream resolved. Selecting stream profile: {chosen_label}")
         data = post_metadata(session, target_url)
         m3u8_url = target_url
 
     if data.get('type') != 'media':
-        raise Exception(f"Failed to resolve media segments (type={data.get('type')}).")
+        raise Exception(f"Failed to resolve media tracks payload (type received={data.get('type')}).")
 
     segments = data['data']['segments']
     key_info = data['data'].get('key')
@@ -298,9 +318,9 @@ def custom_hls_downloader(m3u8_url, output_path):
     headers = get_dynamic_headers(m3u8_url)
 
     if total_segments == 0:
-        raise Exception("No segments found.")
+        raise Exception("Zero stream components found inside the payload configuration.")
 
-    add_log(f"[*] {total_segments} chunks to download.")
+    add_log(f"[*] Extracting video pipeline: {total_segments} HLS chunks found.")
     downloaded_chunks = [None] * total_segments
     start_time = time.time()
     failed = 0
@@ -315,12 +335,16 @@ def custom_hls_downloader(m3u8_url, output_path):
             else:
                 failed += 1
             done += 1
-            if done % 5 == 0 or done == total_segments:
-                pct = int((done / total_segments) * 100)
-                update_state(progress=f"{pct}%")
-                add_log(f"Progress: {pct}% ({done}/{total_segments} chunks, {failed} failed)")
+            
+            # FIXED: UI updates on every individual chunk for smooth rendering
+            pct = int((done / total_segments) * 100)
+            update_state(progress=f"{pct}%")
+            
+            # Text logs remain readable without flooding
+            if done % 10 == 0 or done == total_segments:
+                add_log(f"Progress Status: {pct}% ({done}/{total_segments} files completed, {failed} broken updates)")
 
-    add_log("[*] Compiling video file...")
+    add_log("[*] Finalizing download — merging fragmented transport streams...")
     written = 0
     with open(output_path, 'wb') as outfile:
         for chunk in downloaded_chunks:
@@ -329,13 +353,14 @@ def custom_hls_downloader(m3u8_url, output_path):
                 written += 1
 
     if written == 0:
-        raise Exception("All chunks failed to download.")
-    add_log(f"[+] Done: {written}/{total_segments} chunks in {int(time.time() - start_time)}s")
+        raise Exception("Download aborted: 100% of pipeline data streams dropped.")
+    add_log(f"[+] Download phase successful: {written}/{total_segments} chunks packed in {int(time.time() - start_time)}s")
 
 # ==========================================
 # BATCH ORCHESTRATOR
 # ==========================================
 def batch_orchestrator(video_list):
+    add_log(f"[*] Processing incoming payload structure containing {len(video_list)} entries...")
     update_state(
         status="downloading",
         total_videos=len(video_list),
@@ -366,7 +391,9 @@ def batch_orchestrator(video_list):
             if idx < len(server_state["queue"]):
                 server_state["queue"][idx]["status"] = "downloading"
 
-        add_log(f">> [{idx+1}/{len(video_list)}] {lec_name}")
+        add_log(f"\n==================================================")
+        add_log(f">> PIPELINE DEPLOYMENT [{idx+1}/{len(video_list)}]: {lec_name}")
+        add_log(f"==================================================")
 
         safe_batch = sanitize_filename(video.get('batch', 'Unknown'))
         safe_subj  = sanitize_filename(video.get('subject', 'Unknown'))
@@ -379,7 +406,7 @@ def batch_orchestrator(video_list):
 
         mpd_link = video.get('mpd_url', '')
         if mpd_link in ["FAILED_TIMEOUT", "MANUALLY_SKIPPED", "DUPLICATE_ERROR"] or not mpd_link:
-            add_log(f"[!] SKIP: {mpd_link} — {safe_lec}")
+            add_log(f"[!] Target URL blacklisted or empty ({mpd_link}) — skipping item.")
             with state_lock:
                 server_state["failed_videos"] += 1
                 if idx < len(server_state["queue"]):
@@ -398,7 +425,7 @@ def batch_orchestrator(video_list):
 
             if os.path.exists(output_path):
                 os.remove(output_path)
-                add_log(f"[*] Deleted local file: {safe_lec}.ts")
+                add_log(f"[*] Flushed localized storage artifacts for: {safe_lec}.ts")
 
             with state_lock:
                 server_state["completed_videos"] += 1
@@ -406,7 +433,7 @@ def batch_orchestrator(video_list):
                     server_state["queue"][idx]["status"] = "done"
 
         except Exception as e:
-            add_log(f"[!] ERROR: {safe_lec} — {e}")
+            add_log(f"[!] CRITICAL SYSTEM FAULT processing {safe_lec}: {e}")
             with state_lock:
                 server_state["failed_videos"] += 1
                 if idx < len(server_state["queue"]):
@@ -418,7 +445,7 @@ def batch_orchestrator(video_list):
                     pass
 
     update_state(status="completed")
-    add_log(f"[OK] BATCH DONE in {int(time.time() - batch_start)}s")
+    add_log(f"\n[OK] ALL BATCH JOBS COMPLETED in {int(time.time() - batch_start)}s")
 
 # ==========================================
 # FLASK ROUTES
@@ -443,18 +470,18 @@ def set_cookies():
     if not cookies:
         return jsonify({"error": "Could not parse cookies from cURL command"}), 400
     SESSION_COOKIES = cookies
-    add_log(f"[+] Cookies updated ({len(cookies)} cookies loaded)")
+    add_log(f"[+] Cookies parsed successfully ({len(cookies)} header profiles mapped)")
     return jsonify({"status": "ok", "count": len(cookies)})
 
 @app.route('/download_batch', methods=['POST'])
 def start_batch_download():
     with state_lock:
         if server_state["status"] == "downloading":
-            return jsonify({"error": "Server is busy"}), 400
+            return jsonify({"error": "Server operation currently busy with active queues"}), 400
     data = request.get_json(silent=True) or {}
     video_list = data.get('videos', [])
     if not video_list:
-        return jsonify({"error": "Empty video list"}), 400
+        return jsonify({"error": "Received empty batch manifest list"}), 400
     thread = threading.Thread(target=batch_orchestrator, args=(video_list,))
     thread.daemon = True
     thread.start()
@@ -470,7 +497,7 @@ def index():
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>PW Downloader</title>
+<title>PW Downloader Matrix</title>
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body { background: #0d0d0d; color: #e0e0e0; font-family: 'Courier New', monospace; font-size: 13px; padding: 20px; }
@@ -483,7 +510,7 @@ def index():
   .stat { color: #94a3b8; }
   .stat span { color: #e0e0e0; font-weight: bold; }
   .progress-wrap { background: #111; border-radius: 4px; height: 10px; margin: 8px 0; overflow: hidden; }
-  .progress-bar { height: 10px; background: #4f46e5; transition: width 0.3s; border-radius: 4px; }
+  .progress-bar { height: 10px; background: #4f46e5; transition: width 0.1s linear; border-radius: 4px; }
   .queue-item { display: flex; align-items: center; gap: 10px; padding: 6px 0; border-bottom: 1px solid #222; }
   .queue-item:last-child { border-bottom: none; }
   .badge { font-size: 11px; padding: 2px 8px; border-radius: 4px; font-weight: bold; min-width: 74px; text-align: center; }
@@ -494,7 +521,7 @@ def index():
   .badge.failed    { background: #450a0a; color: #f87171; }
   .lec-name { flex: 1; color: #cbd5e1; }
   .lec-meta { color: #475569; font-size: 11px; }
-  #log { background: #0a0a0a; border: 1px solid #222; border-radius: 6px; padding: 10px; height: 200px; overflow-y: auto; font-size: 11px; color: #6b7280; }
+  #log { background: #0a0a0a; border: 1px solid #222; border-radius: 6px; padding: 10px; height: 240px; overflow-y: auto; font-size: 11px; color: #6b7280; }
   #log p { margin: 1px 0; line-height: 1.5; }
   #log p.info  { color: #60a5fa; }
   #log p.ok    { color: #4ade80; }
@@ -563,9 +590,9 @@ def index():
 
   function colorLog(line) {
     if (line.includes('[TG]')) return 'tg';
-    if (line.includes('[+]') || line.includes('Done') || line.includes('success')) return 'ok';
-    if (line.includes('[!]') || line.includes('ERROR') || line.includes('failed')) return 'err';
-    if (line.includes('Progress') || line.includes('>>')) return 'info';
+    if (line.includes('[+]') || line.includes('Done') || line.includes('success') || line.includes('COMPLETED')) return 'ok';
+    if (line.includes('[!]') || line.includes('ERROR') || line.includes('failed') || line.includes('FAULT')) return 'err';
+    if (line.includes('Progress') || line.includes('>>') || line.includes('[*]')) return 'info';
     return '';
   }
 
@@ -609,7 +636,7 @@ def index():
     }).catch(() => {});
   }
 
-  setInterval(poll, 2000);
+  setInterval(poll, 1500);
   poll();
 </script>
 </body>
