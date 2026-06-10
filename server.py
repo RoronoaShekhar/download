@@ -18,6 +18,7 @@ import re
 import time
 import threading
 import json
+import random
 
 app = Flask(__name__)
 CORS(app)
@@ -38,6 +39,7 @@ TELEGRAM_CHANNEL_ID = os.environ.get("TELEGRAM_CHANNEL_ID", "")
 
 state_lock = threading.Lock()
 log_lock = threading.Lock()
+proxy_lock = threading.Lock()
 
 server_state = {
     "status": "idle",
@@ -52,6 +54,70 @@ server_state = {
 }
 
 SESSION_COOKIES = {}
+
+# ==========================================
+# PROXY MANAGEMENT
+# ==========================================
+PROXY_LIST = []
+PROXY_SOURCES = [
+    "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt",
+    "https://raw.githubusercontent.com/clarketm/proxy-list/master/proxy-list-raw.txt",
+    "https://raw.githubusercontent.com/mmpx12/proxy-list/master/http.txt",
+]
+
+def fetch_proxy_list():
+    global PROXY_LIST
+    print("[*] Fetching fresh proxy list...")
+    proxies = set()
+    for source in PROXY_SOURCES:
+        try:
+            r = requests.get(source, timeout=10)
+            if r.status_code == 200:
+                for line in r.text.strip().splitlines():
+                    line = line.strip()
+                    if re.match(r'^\d+\.\d+\.\d+\.\d+:\d+$', line):
+                        proxies.add(line)
+        except Exception:
+            pass
+    with proxy_lock:
+        PROXY_LIST = list(proxies)
+    print(f"[*] Loaded {len(PROXY_LIST)} proxies.")
+
+def test_proxy(proxy_str):
+    """Test if proxy works with the target site."""
+    proxies = {"http": f"http://{proxy_str}", "https": f"http://{proxy_str}"}
+    try:
+        r = requests.get("https://download.pwthor.live", proxies=proxies, timeout=8)
+        return r.status_code < 500
+    except Exception:
+        return False
+
+def get_working_proxy():
+    """Try proxies until one works, return proxy dict or None."""
+    with proxy_lock:
+        candidates = list(PROXY_LIST)
+    random.shuffle(candidates)
+    for proxy_str in candidates[:30]:  # Test up to 30
+        if test_proxy(proxy_str):
+            print(f"[+] Working proxy found: {proxy_str}")
+            return {"http": f"http://{proxy_str}", "https": f"http://{proxy_str}"}
+    print("[!] No working proxy found — trying direct connection.")
+    return None
+
+# Fetch proxies at startup in background
+threading.Thread(target=fetch_proxy_list, daemon=True).start()
+
+ACTIVE_PROXY = None
+PROXY_REFRESH_TIME = 0
+
+def get_proxy():
+    """Return cached proxy, refresh if older than 10 mins or None."""
+    global ACTIVE_PROXY, PROXY_REFRESH_TIME
+    now = time.time()
+    if ACTIVE_PROXY is None or (now - PROXY_REFRESH_TIME) > 600:
+        ACTIVE_PROXY = get_working_proxy()
+        PROXY_REFRESH_TIME = now
+    return ACTIVE_PROXY
 
 def update_state(**kwargs):
     with state_lock:
@@ -128,9 +194,13 @@ def get_dynamic_headers(m3u8_url):
     headers["referer"] = f"https://download.pwthor.live/?url={encoded_url}"
     return headers
 
-def make_session():
+def make_session(use_proxy=True):
     session = requests.Session()
     session.cookies.update(SESSION_COOKIES)
+    if use_proxy:
+        proxy = get_proxy()
+        if proxy:
+            session.proxies.update(proxy)
     return session
 
 # ==========================================
@@ -163,6 +233,7 @@ def upload_to_telegram(file_path, caption=""):
 # CORE DOWNLOADER
 # ==========================================
 def post_metadata(session, url):
+    global ACTIVE_PROXY, PROXY_REFRESH_TIME
     last_err = None
     for attempt in range(META_RETRIES):
         try:
@@ -171,8 +242,15 @@ def post_metadata(session, url):
             return resp.json()
         except Exception as e:
             last_err = e
+            add_log(f"[!] Metadata attempt {attempt+1} failed: {e} — rotating proxy...")
+            # Force proxy refresh on next attempt
+            ACTIVE_PROXY = None
+            PROXY_REFRESH_TIME = 0
+            new_proxy = get_proxy()
+            if new_proxy:
+                session.proxies.update(new_proxy)
             time.sleep(2)
-    raise Exception(f"Metadata fetch failed: {last_err}")
+    raise Exception(f"Metadata fetch failed after {META_RETRIES} attempts: {last_err}")
 
 def download_and_decrypt(index, segment_url, key_info, headers, session):
     for attempt in range(SEGMENT_RETRIES):
